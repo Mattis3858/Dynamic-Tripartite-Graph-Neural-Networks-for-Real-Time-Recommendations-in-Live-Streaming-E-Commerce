@@ -1,3 +1,10 @@
 .qodo
 venv
 data
+training_data
+results
+saved_checkpoints
+saved_models
+
+__pycache__
+log
