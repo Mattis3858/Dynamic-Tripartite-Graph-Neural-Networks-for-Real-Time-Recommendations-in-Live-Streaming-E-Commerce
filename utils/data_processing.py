@@ -101,14 +101,10 @@ def get_data(
     randomize_features=False,
     base_dir="training_data",
 ):
-    graph_df, node_features, edge_features = _load_tripartite(
-        dataset_name, base_dir=base_dir
-    )
+    graph_df, node_features, edge_features = _load_tripartite(dataset_name, base_dir=base_dir)
 
     if randomize_features:
         node_features = np.random.rand(node_features.shape[0], node_features.shape[1])
-
-    val_time, test_time = list(np.quantile(graph_df.ts.values, [0.70, 0.85]))
 
     sources = graph_df.src.values
     destinations = graph_df.dst.values
@@ -118,158 +114,96 @@ def get_data(
 
     full_data = Data(sources, destinations, timestamps, edge_idxs, labels)
 
-    random.seed(2020)
+    # -------- 1) 只用「時間排序 + 依索引比例切」 --------
+    order = np.argsort(timestamps, kind="mergesort")
+    n = len(order)
+    train_end = max(1, int(0.70 * n))
+    val_end   = max(train_end + 1, int(0.85 * n))
+    if val_end >= n:
+        val_end = n - 1  # 至少留 1 筆給 test
 
+    idx_train = order[:train_end]
+    idx_val   = order[train_end:val_end]
+    idx_test  = order[val_end:]
+
+    # 保底：確保 val / test 非空
+    if len(idx_val) == 0 and n >= 2:
+        idx_val = order[train_end:train_end+1]
+        idx_test = order[train_end+1:]
+    if len(idx_test) == 0 and len(idx_val) > 1:
+        idx_test = np.array([idx_val[-1]])
+        idx_val  = idx_val[:-1]
+
+    mask = np.zeros(n, dtype=bool)
+    train_mask = mask.copy(); train_mask[idx_train] = True
+    val_mask   = mask.copy(); val_mask[idx_val]     = True
+    test_mask  = mask.copy(); test_mask[idx_test]   = True
+
+    # -------- 2) inductive new nodes：從 val+test 期的節點抽樣 --------
+    random.seed(2020)
     node_set = set(sources) | set(destinations)
     n_total_unique_nodes = len(node_set)
 
-    # 篩出 val 之後會出現的節點做為可抽樣母體
-    test_node_set = set(sources[timestamps > val_time]).union(
-        set(destinations[timestamps > val_time])
-    )
+    post_train_idx = np.concatenate([idx_val, idx_test])  # val+test 段
+    test_node_set = set(sources[post_train_idx]).union(set(destinations[post_train_idx])) if len(post_train_idx) > 0 else set()
+
     test_node_list = sorted(test_node_set)
-    # k 取 10% 的總唯一節點，並加上 guard
     k = int(0.1 * n_total_unique_nodes)
-    if k <= 0:
-        k = 1
-    k = min(k, len(test_node_list))  # 不能超過母體
+    k = max(0, min(k, len(test_node_list)))  # 允許 0
     new_test_node_set = set(random.sample(test_node_list, k)) if k > 0 else set()
 
-    # 將 new_test_node_set 當成「只在 val/test 期才會見到的新節點」
-    # 注意：下方用 src/dst（不是 u/i）
+    # 只把「含新節點」的邊從訓練集移除（val/test 不動）
     new_test_source_mask = graph_df.src.map(lambda x: x in new_test_node_set).values
-    new_test_destination_mask = graph_df.dst.map(
-        lambda x: x in new_test_node_set
-    ).values
-    observed_edges_mask = np.logical_and(
-        ~new_test_source_mask, ~new_test_destination_mask
-    )
+    new_test_destination_mask = graph_df.dst.map(lambda x: x in new_test_node_set).values
+    observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
+    train_mask = np.logical_and(train_mask, observed_edges_mask)
 
-    # 訓練集：時間 <= val_time 且不包含新節點
-    train_mask = np.logical_and(timestamps <= val_time, observed_edges_mask)
-    train_data = Data(
-        sources[train_mask],
-        destinations[train_mask],
-        timestamps[train_mask],
-        edge_idxs[train_mask],
-        labels[train_mask],
-    )
+    # 重新定義 train_data；val/test 保持索引切分
+    train_data = Data(sources[train_mask], destinations[train_mask],
+                      timestamps[train_mask], edge_idxs[train_mask], labels[train_mask])
 
     # 定義 new_node_set：未出現在訓練集的節點
     train_node_set = set(train_data.sources).union(train_data.destinations)
-    assert len(train_node_set & new_test_node_set) == 0
     new_node_set = node_set - train_node_set
 
-    val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time)
-    test_mask = timestamps > test_time
-
-    if different_new_nodes_between_val_and_test:
+    # new node 的 val/test 遮罩（基於「索引切分」的 val_mask/test_mask）
+    if different_new_nodes_between_val_and_test and len(new_test_node_set) > 0:
         n_new_nodes = len(new_test_node_set) // 2
-        val_new_node_list = sorted(list(new_test_node_set))[:n_new_nodes]
-        test_new_node_list = sorted(list(new_test_node_set))[n_new_nodes:]
-        val_new_node_set = set(val_new_node_list)
-        test_new_node_set = set(test_new_node_list)
-
-        edge_contains_new_val_node_mask = np.array(
-            [
-                (a in val_new_node_set or b in val_new_node_set)
-                for a, b in zip(sources, destinations)
-            ]
-        )
-        edge_contains_new_test_node_mask = np.array(
-            [
-                (a in test_new_node_set or b in test_new_node_set)
-                for a, b in zip(sources, destinations)
-            ]
-        )
-        new_node_val_mask = np.logical_and(val_mask, edge_contains_new_val_node_mask)
+        val_new_node_set  = set(sorted(list(new_test_node_set))[:n_new_nodes])
+        test_new_node_set = set(sorted(list(new_test_node_set))[n_new_nodes:])
+        edge_contains_new_val_node_mask  = np.array([(a in val_new_node_set  or b in val_new_node_set) for a,b in zip(sources, destinations)])
+        edge_contains_new_test_node_mask = np.array([(a in test_new_node_set or b in test_new_node_set) for a,b in zip(sources, destinations)])
+        new_node_val_mask  = np.logical_and(val_mask,  edge_contains_new_val_node_mask)
         new_node_test_mask = np.logical_and(test_mask, edge_contains_new_test_node_mask)
     else:
-        edge_contains_new_node_mask = np.array(
-            [
-                (a in new_node_set or b in new_node_set)
-                for a, b in zip(sources, destinations)
-            ]
-        )
-        new_node_val_mask = np.logical_and(val_mask, edge_contains_new_node_mask)
+        edge_contains_new_node_mask = np.array([(a in new_node_set or b in new_node_set) for a,b in zip(sources, destinations)])
+        new_node_val_mask  = np.logical_and(val_mask,  edge_contains_new_node_mask)
         new_node_test_mask = np.logical_and(test_mask, edge_contains_new_node_mask)
 
-    val_data = Data(
-        sources[val_mask],
-        destinations[val_mask],
-        timestamps[val_mask],
-        edge_idxs[val_mask],
-        labels[val_mask],
-    )
-    test_data = Data(
-        sources[test_mask],
-        destinations[test_mask],
-        timestamps[test_mask],
-        edge_idxs[test_mask],
-        labels[test_mask],
-    )
+    # -------- 打包資料（val/test 完全沿用「索引切分」的遮罩） --------
+    val_data = Data(sources[val_mask], destinations[val_mask],
+                    timestamps[val_mask], edge_idxs[val_mask], labels[val_mask])
+    test_data = Data(sources[test_mask], destinations[test_mask],
+                     timestamps[test_mask], edge_idxs[test_mask], labels[test_mask])
 
-    new_node_val_data = Data(
-        sources[new_node_val_mask],
-        destinations[new_node_val_mask],
-        timestamps[new_node_val_mask],
-        edge_idxs[new_node_val_mask],
-        labels[new_node_val_mask],
-    )
-    new_node_test_data = Data(
-        sources[new_node_test_mask],
-        destinations[new_node_test_mask],
-        timestamps[new_node_test_mask],
-        edge_idxs[new_node_test_mask],
-        labels[new_node_test_mask],
-    )
+    new_node_val_data = Data(sources[new_node_val_mask], destinations[new_node_val_mask],
+                             timestamps[new_node_val_mask], edge_idxs[new_node_val_mask],
+                             labels[new_node_val_mask])
+    new_node_test_data = Data(sources[new_node_test_mask], destinations[new_node_test_mask],
+                              timestamps[new_node_test_mask], edge_idxs[new_node_test_mask],
+                              labels[new_node_test_mask])
 
-    print(
-        "The dataset has {} interactions, involving {} different nodes".format(
-            full_data.n_interactions, full_data.n_unique_nodes
-        )
-    )
-    print(
-        "The training dataset has {} interactions, involving {} different nodes".format(
-            train_data.n_interactions, train_data.n_unique_nodes
-        )
-    )
-    print(
-        "The validation dataset has {} interactions, involving {} different nodes".format(
-            val_data.n_interactions, val_data.n_unique_nodes
-        )
-    )
-    print(
-        "The test dataset has {} interactions, involving {} different nodes".format(
-            test_data.n_interactions, test_data.n_unique_nodes
-        )
-    )
-    print(
-        "The new node validation dataset has {} interactions, involving {} different nodes".format(
-            new_node_val_data.n_interactions, new_node_val_data.n_unique_nodes
-        )
-    )
-    print(
-        "The new node test dataset has {} interactions, involving {} different nodes".format(
-            new_node_test_data.n_interactions, new_node_test_data.n_unique_nodes
-        )
-    )
-    print(
-        "{} nodes were used for the inductive testing, i.e. are never seen during training".format(
-            len(new_test_node_set)
-        )
-    )
+    print(f"The dataset has {full_data.n_interactions} interactions, involving {full_data.n_unique_nodes} different nodes")
+    print(f"The training dataset has {train_data.n_interactions} interactions, involving {train_data.n_unique_nodes} different nodes")
+    print(f"The validation dataset has {val_data.n_interactions} interactions, involving {val_data.n_unique_nodes} different nodes")
+    print(f"The test dataset has {test_data.n_interactions} interactions, involving {test_data.n_unique_nodes} different nodes")
+    print(f"The new node validation dataset has {new_node_val_data.n_interactions} interactions, involving {new_node_val_data.n_unique_nodes} different nodes")
+    print(f"The new node test dataset has {new_node_test_data.n_interactions} interactions, involving {new_node_test_data.n_unique_nodes} different nodes")
+    print(f"{len(new_test_node_set)} nodes were used for the inductive testing, i.e. are never seen during training")
 
-    return (
-        node_features,
-        edge_features,
-        full_data,
-        train_data,
-        val_data,
-        test_data,
-        new_node_val_data,
-        new_node_test_data,
-    )
+    return (node_features, edge_features, full_data, train_data, val_data, test_data,
+            new_node_val_data, new_node_test_data)
+
 
 
 def compute_time_statistics(sources, destinations, timestamps):
